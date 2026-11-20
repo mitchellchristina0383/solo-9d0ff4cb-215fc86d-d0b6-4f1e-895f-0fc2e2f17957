@@ -71,13 +71,27 @@ def main() -> int:
     r = client.post("/jobs", json=JOB)
     r.raise_for_status()
     body = r.json()
+    job_id = body["state"]["job_id"]
+    print(f"  作业 id: {job_id}（每张回执都须原样带回）")
     show_plan(body["plan"])
 
     print("\n== 1. 演示乱序回报被拒 (POST /receipts, 非计划第一步)")
     r = client.post(
-        "/receipts", json={"file": "B", "volume": 1, "position": 6, "result": "ok"}
+        "/receipts",
+        json={"job_id": job_id, "file": "B", "volume": 1, "position": 6, "result": "ok"},
     )
     print(f"  HTTP {r.status_code}: {json.dumps(r.json()['detail'], ensure_ascii=False)}")
+
+    print("\n== 1b. 演示旧作业的迟到回执被拒 (POST /jobs 覆盖后用旧 job_id)")
+    r = client.post("/jobs", json=JOB)
+    r.raise_for_status()
+    new_job_id = r.json()["state"]["job_id"]
+    r = client.post(
+        "/receipts",
+        json={"job_id": job_id, "file": "A", "volume": 1, "position": 2, "result": "ok"},
+    )
+    print(f"  HTTP {r.status_code}: {json.dumps(r.json()['detail'], ensure_ascii=False)}")
+    job_id = new_job_id
 
     step = 0
     while True:
@@ -95,6 +109,7 @@ def main() -> int:
         r = client.post(
             "/receipts",
             json={
+                "job_id": job_id,
                 "file": nxt["file"],
                 "volume": nxt["volume"],
                 "position": nxt["position"],
@@ -105,6 +120,14 @@ def main() -> int:
         body = r.json()
         show_state(body["state"])
         show_plan(body["plan"])
+
+    print("\n== 1c. 演示同步骤重复回执被拒（作业结束后再报任意步骤也被拒）")
+    r = client.post(
+        "/receipts",
+        json={"job_id": job_id, "file": "F", "volume": 3, "position": 8, "result": "ok"},
+    )
+    print(f"  HTTP {r.status_code}: {json.dumps(r.json()['detail'], ensure_ascii=False)}")
+
 
     final = client.get("/state").json()
     print("\n== 取回流程结束 ==")

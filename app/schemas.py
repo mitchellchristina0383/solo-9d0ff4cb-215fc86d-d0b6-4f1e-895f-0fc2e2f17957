@@ -43,8 +43,9 @@ class JobIn(BaseModel):
 
 
 class ReceiptIn(BaseModel):
-    """值班员回报：必须对应当前计划的第一个读带步骤。"""
+    """值班员回报：必须对应当前计划的第一个读带步骤，并携带所属作业的 job_id。"""
 
+    job_id: int = Field(ge=1, description="回执所属作业的 id（来自创建作业/计划/状态响应）；作业被替换或删除后旧 id 的回执一律拒绝")
     file: str = Field(min_length=1)
     volume: int = Field(ge=1)
     position: int = Field(ge=1)
@@ -52,7 +53,7 @@ class ReceiptIn(BaseModel):
 
     model_config = {
         "json_schema_extra": {
-            "examples": [{"file": "A", "volume": 1, "position": 2, "result": "ok"}]
+            "examples": [{"job_id": 1, "file": "A", "volume": 1, "position": 2, "result": "ok"}]
         }
     }
 
@@ -66,6 +67,7 @@ class StepOut(BaseModel):
 
 
 class PlanOut(BaseModel):
+    job_id: int = Field(description="本计划所属作业的 id；回执须原样带回")
     volumes_used: list[int]
     mounts: int = Field(description="本计划装带次数")
     rewinds: int = Field(description="本计划回卷次数")
@@ -76,6 +78,7 @@ class PlanOut(BaseModel):
 
 
 class StateOut(BaseModel):
+    job_id: int = Field(description="当前作业的 id；回执须携带此 id")
     current_volume: int | None = Field(description="当前已挂载的卷号（空机为 null）")
     head: int = Field(description="带头当前卷内序号")
     pending: list[str]

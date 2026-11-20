@@ -1,5 +1,11 @@
-"""API 集成测试：完整取回流程，含坏副本停用与重排。"""
+"""API 集成测试：完整取回流程，含坏副本停用、重排、迟到/重复回执与并发快照。"""
+import socket
+import threading
+import time
+
+import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -35,16 +41,25 @@ def create_demo_job():
     return resp.json()
 
 
-def report(file, volume, position, result):
+def report(file, volume, position, result, job_id=None):
+    if job_id is None:
+        job_id = client.get("/state").json()["job_id"]
     return client.post(
         "/receipts",
-        json={"file": file, "volume": volume, "position": position, "result": result},
+        json={
+            "job_id": job_id,
+            "file": file,
+            "volume": volume,
+            "position": position,
+            "result": result,
+        },
     )
 
 
 def test_initial_plan_is_optimal():
     body = create_demo_job()
     plan = body["plan"]
+    assert plan["job_id"] == body["state"]["job_id"] == 1
     assert plan["cost"] == 2
     assert plan["mounts"] == 2 and plan["rewinds"] == 0
     assert plan["next_step"] == {
@@ -53,6 +68,13 @@ def test_initial_plan_is_optimal():
     state = body["state"]
     assert state["current_volume"] is None and state["head"] == 0
     assert state["pending"] == list("ABCDEF")
+    # 创建响应里的计划以本次创建刚完成时的进度为准（无已取、无停用、计数为 0）
+    assert state["done"] == [] and state["disabled_copies"] == []
+    assert state["executed"] == {"mounts": 0, "rewinds": 0, "reads_ok": 0, "reads_failed": 0}
+    # 再次创建会分配新的 job_id（旧作业被覆盖）
+    second = create_demo_job()
+    assert second["state"]["job_id"] == 2
+    assert second["plan"]["job_id"] == 2
 
 
 def test_receipt_must_match_first_step():
@@ -170,5 +192,193 @@ def test_validation_errors():
 def test_endpoints_require_job():
     assert client.get("/state").status_code == 404
     assert client.get("/plan").status_code == 404
-    assert report("A", 1, 1, "ok").status_code == 404
+    assert report("A", 1, 1, "ok", job_id=1).status_code == 404
     assert client.delete("/job").status_code == 204
+
+
+def test_late_receipt_after_job_replacement_is_rejected():
+    """旧作业被覆盖后，即便首步 (file,volume,position) 完全相同，
+    旧 job_id 的迟到回执也必须拒绝，新作业的任何进度都不被推进。"""
+    old = create_demo_job()
+    old_id = old["state"]["job_id"]
+    assert old["plan"]["next_step"] == {
+        "seq": 2, "action": "read", "volume": 1, "file": "A", "position": 2,
+    }
+
+    # 覆盖为同清单的新作业：首步仍是 A@1:2，但 job_id 已变
+    new = create_demo_job()
+    new_id = new["state"]["job_id"]
+    assert new_id != old_id
+
+    # 旧作业的迟到回执 → 409，新作业状态原样不动
+    resp = report("A", 1, 2, "ok", job_id=old_id)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["current_job_id"] == new_id
+    state = client.get("/state").json()
+    assert state["job_id"] == new_id
+    assert state["pending"] == list("ABCDEF")
+    assert state["done"] == []
+    assert state["current_volume"] is None and state["head"] == 0
+    assert state["executed"] == {"mounts": 0, "rewinds": 0, "reads_ok": 0, "reads_failed": 0}
+    assert state["history"] == []
+    # 新作业自己的回执正常生效，响应反映的是新作业的进度
+    ok = report("A", 1, 2, "ok", job_id=new_id)
+    assert ok.status_code == 200
+    assert ok.json()["state"]["done"] == ["A"]
+    assert ok.json()["plan"]["job_id"] == new_id
+
+
+def test_late_receipt_after_job_delete_is_rejected():
+    old = create_demo_job()
+    old_id = old["state"]["job_id"]
+    client.delete("/job")
+    # 已删除作业的迟到回执 → 404；重新创建后旧 id 同样不可用
+    assert report("A", 1, 2, "ok", job_id=old_id).status_code == 404
+    create_demo_job()
+    assert report("A", 1, 2, "ok", job_id=old_id).status_code == 409
+    # 新作业进度未被迟到回执触碰
+    assert client.get("/state").json()["done"] == []
+
+
+def test_duplicate_receipt_for_same_step_is_rejected():
+    create_demo_job()
+    job_id = client.get("/state").json()["job_id"]
+    first = report("A", 1, 2, "ok", job_id=job_id)
+    assert first.status_code == 200
+    snap1 = first.json()
+    assert snap1["state"]["done"] == ["A"]
+    assert snap1["state"]["executed"]["reads_ok"] == 1
+
+    # 同一步骤再次回报（失败也算）→ 409，带头、副本、计数、历史全部保持原样
+    dup = report("A", 1, 2, "failed", job_id=job_id)
+    assert dup.status_code == 409
+    assert "已经入账" in dup.json()["detail"]["error"]
+    state = client.get("/state").json()
+    assert state["current_volume"] == 1 and state["head"] == 2
+    assert state["done"] == ["A"]
+    assert state["disabled_copies"] == []  # 失败回执未入账，副本未被停用
+    assert state["executed"] == {"mounts": 1, "rewinds": 0, "reads_ok": 1, "reads_failed": 0}
+    assert len(state["history"]) == 1
+
+
+def test_response_snapshot_is_consistent_after_commit():
+    """入账响应里的状态与计划必须同属本次回执刚完成时的进度（不可变快照）。"""
+    create_demo_job()
+    job_id = client.get("/state").json()["job_id"]
+    body = report("A", 1, 2, "failed", job_id=job_id).json()
+    state, plan = body["state"], body["plan"]
+    # 状态与计划携带同一 job_id
+    assert state["job_id"] == plan["job_id"] == job_id
+    # 计划下一步与状态中的待取/带头自洽：A 仍待取，B 是新首步，当前卷 1 带头 2
+    assert state["head"] == 2 and state["current_volume"] == 1
+    assert plan["next_step"]["file"] == "B"
+    assert "A" in state["pending"]
+    # 后续继续推进，旧响应快照内容不被改写（快照独立于可变作业）
+    report("B", 1, 6, "ok", job_id=job_id)
+    assert body["state"]["head"] == 2
+    assert body["state"]["done"] == []
+    assert body["plan"]["next_step"]["file"] == "B"
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_concurrent_receipts_each_response_reflects_its_own_commit():
+    """两步回报并发交错：每张成功响应只能带自己的重排计划与自己的进度，
+    后一步的进度绝不串进先入账的响应；被拒的回执不产生任何副作用。
+
+    锁把两张回执串成两种合法顺序：
+    - A 先 B 后：两张都 200（B 入账时已成为计划首步）；
+    - B 先到：B 与首步不符 → 409，A 200。
+    """
+    create_demo_job()
+    job_id = client.get("/state").json()["job_id"]
+
+    port = _free_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                httpx.get(base + "/docs", timeout=1)
+                break
+            except httpx.TransportError:
+                time.sleep(0.05)
+        else:  # pragma: no cover - 服务起不来时才走这里
+            raise AssertionError("测试用 uvicorn 服务未在限时内就绪")
+
+        # 同一时刻发出两张针对连续两步的回执：首步 A@1:2、次步 B@1:6
+        payload_a = {"job_id": job_id, "file": "A", "volume": 1, "position": 2, "result": "ok"}
+        payload_b = {"job_id": job_id, "file": "B", "volume": 1, "position": 6, "result": "ok"}
+        barrier = threading.Barrier(2)
+        results: dict[str, httpx.Response] = {}
+
+        def send(name: str, payload: dict) -> None:
+            barrier.wait()
+            with httpx.Client(base_url=base, timeout=10) as http:
+                results[name] = http.post("/receipts", json=payload)
+
+        t1 = threading.Thread(target=send, args=("a", payload_a))
+        t2 = threading.Thread(target=send, args=("b", payload_b))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        ra, rb = results["a"], results["b"]
+        statuses = sorted((ra.status_code, rb.status_code))
+        assert statuses in ([200, 200], [200, 409])
+
+        # 校验每张成功响应：状态与计划严格自洽，且只反映本回执入账那一刻的进度
+        for resp in (ra, rb):
+            if resp.status_code != 200:
+                continue
+            body = resp.json()
+            st, pl = body["state"], body["plan"]
+            assert st["job_id"] == pl["job_id"] == job_id
+            # 状态里的已取集合必须与累计成功次数、历史条数完全一致
+            assert st["executed"]["reads_ok"] == len(st["done"]) == len(st["history"])
+            # 计划首步指向的文件必须仍在待取清单中（状态与计划不得各说各话）
+            nxt = pl["next_step"]
+            if nxt is not None:
+                assert nxt["file"] in st["pending"]
+            # 响应快照必须与按其历史重放得到的进度一致（快照不被后续提交改写）
+            assert st["head"] == st["history"][-1]["position"]
+            assert st["current_volume"] == st["history"][-1]["volume"]
+
+        body_a = ra.json()
+        if ra.status_code == 200:
+            # A 的响应：无论它先还是后入账，done 里有 A；若 B 已先入账则会是 409，
+            # 因此 200 时 A 必然是第一笔，done 恰为 ["A"]，计划首步是 B
+            assert body_a["state"]["done"] == ["A"]
+            assert body_a["state"]["head"] == 2
+            assert "B" not in body_a["state"]["done"]
+            assert body_a["plan"]["next_step"] == {
+                "seq": 1, "action": "read", "volume": 1, "file": "B", "position": 6,
+            }
+        else:
+            # B 先到被拒：期望首步仍是 A，且无任何副作用
+            assert rb.status_code == 200
+            assert ra.json()["detail"]["expected"]["file"] == "A"
+
+        # 最终状态：被拒的一步未生效，成功的都已生效；补报后流程继续
+        final = client.get("/state").json()
+        if rb.status_code == 409:
+            assert final["done"] == ["A"] and final["head"] == 2
+            follow = report("B", 1, 6, "ok", job_id=job_id)
+            assert follow.status_code == 200
+            assert follow.json()["state"]["done"] == ["A", "B"]
+        else:
+            assert final["done"] == ["A", "B"] and final["head"] == 6
+            assert final["executed"]["reads_ok"] == 2
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
